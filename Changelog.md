@@ -8,6 +8,8 @@ Compiler Features:
 
 
 Bugfixes:
+* Assembly-Json: Fix assembly json export to store jump types of operations in `jumpType` field instead of `value`.
+* Assembly-Json: Fix assembly json to include source list in `sourceList` field.
 
 
 
