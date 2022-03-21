@@ -9,6 +9,8 @@ import sys
 import traceback
 import re
 import tty
+import functools
+from collections import namedtuple
 
 from typing import Any, List, Optional, Tuple, Union
 from enum import Enum, auto
@@ -17,11 +19,53 @@ from itertools import islice
 import colorama # Enables the use of SGR & CUP terminal VT sequences on Windows.
 from deepdiff import DeepDiff
 
+TestRegexesTuple = namedtuple("TestRegexesTuple", [
+    "sendRequest",
+    "findQuotedTag",
+    "findTag",
+    "diagnostic"
+])
+TEST_REGEXES = TestRegexesTuple(
+    re.compile(R'^// -> (?P<method>[\w\/]+) {'),
+    re.compile(R'(?P<tag>@\w+)'),
+    re.compile(R'(?P<tag>"@\w+")'),
+    re.compile(R'^// (?P<tag>@\w+) (?P<code>\d\d\d\d)'),
+)
+
+TagRegexesTuple = namedtuple("TagRegexestuple", ["simpleRange", "multilineRange"])
+TAG_REGEXES = TagRegexesTuple(
+    re.compile(R"(?P<range>[\^]+) (?P<tag>@\w+)"),
+    re.compile(R"\^(?P<delimiter>[()]{1,2}) (?P<tag>@\w+)$")
+)
+
+
 def countIndex(sequence, start=0):
     n = start
     for elem in sequence:
         yield n, elem
         n += 1 + len(elem)
+
+# Filter the lines for tag comments and report line number that tags refer to
+def tagsOnly(lines, start=0):
+    n = start
+    numCommentLines = 0
+
+    def hasTag(line):
+        if line.find("// ") != -1:
+            for kind, regex in TAG_REGEXES._asdict().items():
+                if regex.search(line[len("// "):]) != None:
+                    return True
+        return False
+
+    for line in lines:
+        if hasTag(line):
+            numCommentLines += 1
+            yield n - numCommentLines, line
+        else:
+            numCommentLines = 0
+
+        n += 1
+
 
 def preceedComments(sequence):
     result = ""
@@ -41,6 +85,7 @@ class JsonRpcProcess:
     exe_args: List[str]
     process: subprocess.Popen
     trace_io: bool
+    cached_message: str
 
     def __init__(self, exe_path: str, exe_args: List[str], trace_io: bool = True):
         self.exe_path = exe_path
@@ -64,7 +109,7 @@ class JsonRpcProcess:
         if self.trace_io:
             print(f"{SGR_TRACE}{topic}:{SGR_RESET} {message}")
 
-    def receive_message(self) -> Union[None, dict]:
+    def receive_message(self, peek = False) -> Union[None, dict]:
         # Note, we should make use of timeout to avoid infinite blocking if nothing is received.
         CONTENT_LENGTH_HEADER = "Content-Length: "
         CONTENT_TYPE_HEADER = "Content-Type: "
@@ -187,13 +232,13 @@ class Counter:
     passed: int = 0
     failed: int = 0
 
-
 class Regexes(Enum):
     SimpleRange = auto()
     MultilineRange = auto()
 
-    SendMessage = auto()
+    SendRequest = auto()
     FindQuotedTag = auto()
+    FindTag = auto()
     Diagnostic = auto()
 
 # Returns the given marker with the end extended by 'amount'
@@ -213,6 +258,111 @@ def encode_tags(z):
     raise TypeError(f'Object of type {o.__class__.__name__} '
                     f'is not JSON serializable')
 
+class TestParser:
+    RequestAndResponse = namedtuple('RequestAndResponse',
+        "method, request, response, responseBegin, responseEnd"
+    )
+    Diagnostic = namedtuple('Diagnostic', 'marker code')
+
+    def __init__(self, content):
+        testDefStartIdx = content.find("// ----")
+
+        self.lines = islice(countIndex(content[testDefStartIdx:].splitlines(), testDefStartIdx), 1, None)
+        self.nextLine()
+
+    def parse(self):
+        diagnostics = self.parseDiagnostics()
+        yield diagnostics
+
+        while self.currentLine != None:
+            yield self.parseRequestAndResponse()
+
+    def parseRequestAndResponse(self):
+        RESPONSE_START = "// <- {"
+        BLOCK_END = "// }"
+        COMMENT_PREFIX = "// "
+
+        ret = {}
+        # Parse request header
+        requestResult = TEST_REGEXES.sendRequest.match(self.line())
+        if requestResult != None:
+            ret["method"] = requestResult.group("method")
+            ret["request"] = "{\n"
+        else:
+            ret["method"] = None
+            return ret
+
+        self.nextLine()
+
+        # Search for request block end
+        while self.currentLine != None:
+            line = self.line()
+            ret["request"] += line[len(COMMENT_PREFIX):] + "\n"
+
+            self.nextLine()
+
+            if line.startswith(BLOCK_END):
+                break
+
+            # Reached end without finding block_end. Abort.
+            if self.currentLine == None:
+                ret["request"] = None
+                return ret
+
+
+        # Parse response header
+        if self.line().startswith(RESPONSE_START):
+            ret["response"] = self.line()[len(RESPONSE_START)-1:] + "\n"
+            ret["responseBegin"] = self.position()
+        else:
+            ret["response"] = None
+            return ret
+
+        # Search for request block end
+        while self.currentLine != None:
+            ret["response"] += self.line()[len(COMMENT_PREFIX):] + "\n"
+
+            if self.line().startswith(BLOCK_END):
+                ret["responseEnd"] = self.position()
+                break
+
+            self.nextLine()
+
+            # Reached end without finding block_end. Abort.
+            if self.currentLine == None:
+                ret["response"] = None
+                return ret
+
+        return ret
+
+
+    def nextLine(self):
+        self.currentLine = next(self.lines, None)
+
+    def line(self):
+        return self.currentLine[1]
+
+    # Returns current byte position
+    def position(self):
+        return self.currentLine[0]
+
+    def parseDiagnostics(self):
+        diagnostics = []
+
+        while self.currentLine != None:
+            print(self.currentLine)
+            diagnosticMatch = TEST_REGEXES.diagnostic.match(self.line())
+            if diagnosticMatch == None:
+                break
+
+            diagnostics.append(self.Diagnostic(
+                diagnosticMatch.group("tag"),
+                int(diagnosticMatch.group("code"))
+            ))
+            self.nextLine()
+
+        return diagnostics
+
 
 class SolidityLSPTestSuite: # {{{
     test_counter = Counter()
@@ -220,8 +370,6 @@ class SolidityLSPTestSuite: # {{{
     print_assertions: bool = False
     trace_io: bool = False
     test_pattern: str
-    marker_regexes: {}
-    test_definition_regexes: {}
 
     def __init__(self):
         colorama.init()
@@ -232,15 +380,6 @@ class SolidityLSPTestSuite: # {{{
         self.print_assertions = args.print_assertions
         self.trace_io = args.trace_io
         self.test_pattern = args.test_pattern
-        self.marker_regexes = {
-            Regexes.SimpleRange: re.compile(R"(?P<range>[\^]+) (?P<tag>@\w+)"),
-            Regexes.MultilineRange: re.compile(R"\^(?P<delimiter>[()]{1,2}) (?P<tag>@\w+)$")
-        }
-
-        self.test_definition_regexes = {
-            Regexes.SendMessage: re.compile(R'^// -> (?P<message>[\w\/]+) {'),
-            Regexes.FindQuotedTag: re.compile(R'(?P<tag>"@\w+")')
-        }
 
         print(f"{SGR_NOTICE}test pattern: {self.test_pattern}{SGR_RESET}")
 
@@ -407,6 +546,7 @@ class SolidityLSPTestSuite: # {{{
         startEndColumns: Tuple[int, int] = None,
         marker: {} = None
     ):
+        print(diagnostic)
         self.expect_equal(diagnostic['code'], code, f'diagnostic: {code}')
 
         if marker:
@@ -470,16 +610,48 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(response['result']), 1, message)
         self.expect_location(response['result'][0], expected_uri, expected_lineNo, expected_startEndColumns)
 
-    def replace_ranges_with_tags(self, content, markers):
+    def parse_json_with_tags(self, content, markersFallback):
+        splitted = TEST_REGEXES.findTag.split(content)
+
+        # add quotes so we can parse it as json
+        contentReplaced = '"'.join(splitted)
+        contentJson = json.loads(contentReplaced)
+
+        def replace_tag(data, markers):
+            # Check if we need markers from a specific file
+            if "uri" in data:
+                markers = self.getFileMarkers(data["uri"][:-len(".sol")])
+
+            for key, val in data.items():
+                if key == "range":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange
+                elif key == "position":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange["start"]
+                elif isinstance(val, dict):
+                    replace_tag(val, markers)
+                elif isinstance(val, list):
+                    for el in val:
+                        replace_tag(el, markers)
+            return data
+
+        return replace_tag(contentJson, markersFallback)
+
+
+    def replace_ranges_with_tags(self, content):
         # Replace matching ranges with "@<tagname>"
-        for tag, tagRange in markers.items():
-            for result in content["result"]:
-                if "range" in result:
+        for result in content["result"]:
+            markers = self.getFileMarkers(result["uri"][:-len(".sol")])
+            if "range" in result:
+                for tag, tagRange in markers.items():
                     if tagRange == result["range"]:
                         result["range"] = str(tag)
 
         # Convert JSON to string and split it at the quoted tags
-        splitted = self.test_definition_regexes[Regexes.FindQuotedTag].split(json.dumps(content, indent=4, sort_keys=True))
+        splitted = TEST_REGEXES.findQuotedTag.split(json.dumps(content, indent=4, sort_keys=True))
 
         # remove the quotes and return result
         return "".join(map(lambda p: p[1:-1] if p.startswith('"@') else p, splitted))
@@ -565,6 +737,7 @@ class SolidityLSPTestSuite: # {{{
         self.expect_diagnostic(report['diagnostics'][0], code=2072, marker=marker)
 
 
+    @functools.lru_cache
     def get_file_tags(self, test_name: str, verbose=False):
         """
         Finds all tags (e.g. @tagname) in the given test and returns them as a
@@ -579,14 +752,12 @@ class SolidityLSPTestSuite: # {{{
 
         markers = {}
 
-        for lineNum, line in enumerate(content.splitlines(), start=-1):
+        for lineNum, line in tagsOnly(content.splitlines()):
             commentStart = line.find("//")
-            if commentStart == -1:
-                continue
 
-            for kind, regex in self.marker_regexes.items():
+            for kind, regex in TAG_REGEXES._asdict().items():
                 for match in regex.finditer(line[commentStart:]):
-                    if kind == Regexes.SimpleRange:
+                    if kind == "simpleRange":
                         markers[match.group("tag")] = {
                             "start": {
                                 "line": lineNum,
@@ -596,7 +767,7 @@ class SolidityLSPTestSuite: # {{{
                                 "line": lineNum,
                                 "character": match.end("range") + commentStart
                         }}
-                    elif kind == Regexes.MultilineRange:
+                    elif kind == "multilineRange":
                         if match.group("delimiter") == "(":
                             markers[match.group("tag")] = \
                                 { "start": { "line": lineNum, "character": 0 } }
@@ -678,81 +849,62 @@ class SolidityLSPTestSuite: # {{{
         TESTS = ['goto_definition']
 
         for test in TESTS:
-            published_diagnostics = self.open_file_and_wait_for_diagnostics(solc, test, 2)
             content = self.get_test_file_contents(test)
             markers = self.getFileMarkers(test)
-            testDefStartIdx = content.find("// ----")
-            message = ""
-            body = ""
-            expectedResponse = ""
-            expectedResponseIdx = (-1, -1)
 
-            for idx, line in islice(countIndex(content[testDefStartIdx:].splitlines(), testDefStartIdx), 1, None):
-                messageResult = self.test_definition_regexes[Regexes.SendMessage].match(line)
-                if len(message) == 0:
-                    if messageResult != None:
-                        message = messageResult.group("message")
-                        body = "{\n"
-                        continue
+            for part in TestParser(content).parse():
+                if isinstance(part, list):
+                    print(part)
+                    published_diagnostics = \
+                        self.open_file_and_wait_for_diagnostics(solc, test, len(part))
+
+                    print(published_diagnostics)
+                    self.expect_equal(len(published_diagnostics), len(part), "Amount of diagnostic does not match!")
+                    for actual, expected in zip(published_diagnostics, part):
+                        self.expect_equal(True, expected.marker in markers, "Marker " + expected.marker + " not found.")
+                        self.expect_diagnostic(
+                            actual,
+                            code=expected.code,
+                            marker=markers[expected.marker]
+                        )
+
+                    continue
+
+                requestBodyJson = self.parse_json_with_tags(part['request'], markers)
+                # add textDocument/uri if missing
+                if 'textDocument' not in requestBodyJson:
+                    requestBodyJson['textDocument'] = { 'uri': self.get_test_file_uri(test) }
+                actualResponseJson = solc.call_method(part['method'], requestBodyJson)
+
+                for result in actualResponseJson["result"]:
+                    result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
+
+                try:
+                    expectedResponseJson = self.parse_json_with_tags(part['response'], markers)
+                except json.decoder.JSONDecodeError:
+                    expectedResponseJson = None
+
+
+                if expectedResponseJson != actualResponseJson:
+                    print("Request failed: \n" + request)
+                    actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
+
+                    if expectedResponseJson == None:
+                        print("Failed to parse expected response, received: \n" + actualResponsePretty)
                     else:
-                        print("Found no request header, skipping test " + test)
-                        break # breaks outer loop as well
-                elif len(expectedResponse) == 0:
-                    RESPONSE_START = "// <- {"
-                    if line.startswith(RESPONSE_START):
-                        expectedResponse = line[len(RESPONSE_START)-1:] + "\n"
-                        expectedResponseIdx = (idx, -1)
-                        continue
+                        print("Expected:\n" + \
+                            self.replace_ranges_with_tags(expectedResponseJson) + \
+                            "\nbut got:\n" + actualResponsePretty
+                        )
+                    print("(u)pdate/(r)etry/(i)gnore?")
+                    userResponse = sys.stdin.read(1)
+                    if userResponse == "u":
+                        content = content[:part['responseBegin']] + \
+                            preceedComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
+                            content[part['responseEnd']:]
 
-                    body = body + line[3:] + "\n"
-                else:
-                    expectedResponse = expectedResponse + line[3:] + "\n"
-                    if line == "// }":
-                        expectedResponseIdx = (expectedResponseIdx[0], idx + len(line))
-                        for tag, tagRange in markers.items():
-                            body = body.replace(tag, json.dumps(tagRange))
-                            expectedResponse = expectedResponse.replace(tag, json.dumps(tagRange))
-
-                        messageBody = json.loads(body)
-                        # add textDocument/uri if missing
-                        if 'textDocument' not in messageBody:
-                            messageBody['textDocument'] = { 'uri': self.get_test_file_uri(test) }
-                        # replace ranges with positions where appropriate
-                        if 'position' in messageBody:
-                            if 'start' in messageBody['position']:
-                                messageBody['position'] = messageBody['position']['start']
-                        responseBody = solc.call_method(message, messageBody)
-
-                        for result in responseBody["result"]:
-                            result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
-
-                        # TODO URI dependent markers
-
-                        expectedResponseJson = json.loads(expectedResponse)
-
-                        if expectedResponseJson != responseBody:
-                            print("Expected:\n" + \
-                                json.dumps(expectedResponseJson, indent=4, sort_keys=True) + \
-                                "\nbut got:\n" + \
-                                json.dumps(responseBody, indent=4, sort_keys=True)
-                            )
-                            print("(u)pdate/(r)etry/(i)gnore?")
-                            userResponse = sys.stdin.read(1)
-                            if userResponse == "u":
-                                content = content[:expectedResponseIdx[0]] + \
-                                    preceedComments("<- " + \
-                                        self.replace_ranges_with_tags(responseBody, markers)) + \
-                                    content[expectedResponseIdx[1]:]
-                                print(content)
-                                with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
-                                    f.write(content)
-
-
-                        message = body = expectedResponse = ""
-
-            else:
-                break
-                print("--\n" + body)
+                        with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
+                            f.write(content)
 
 
     def test_textDocument_didChange_updates_diagnostics(self, solc: JsonRpcProcess) -> None:
@@ -1024,89 +1176,6 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(published_diagnostics[0]['diagnostics']), 0)
         self.expect_equal(len(published_diagnostics[1]['diagnostics']), 1)
         self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 33, (8, 19)) # unused variable in lib.sol
-
-        # library
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(43, 15), # symbol `Lib` in `Lib.add(n, 1)`
-            expected_uri=LIB_URI,
-            expected_lineNo=22,
-            expected_startEndColumns=(8, 11),
-            description="Library symbol from different file"
-        )
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(43, 19), # symbol `add` in `Lib.add(n, 1)`
-            expected_uri=LIB_URI,
-            expected_lineNo=24,
-            expected_startEndColumns=(13, 16),
-            description="Library member symbol from different file"
-        )
-
-        # enum type symbol and enum values
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(46, 19), # symbol `Color` in function signature's parameter
-            expected_uri=LIB_URI,
-            expected_lineNo=13,
-            expected_startEndColumns=(5, 10),
-            description="Enum type"
-        )
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(48, 24), # symbol `Red` in `Color.Red`
-            expected_uri=LIB_URI,
-            expected_lineNo=15,
-            expected_startEndColumns=(4, 7),
-            description="Enum value"
-        )
-
-        # local variable declarations
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(49, 17), # symbol `e` in `(c == e)`
-            expected_uri=FILE_URI,
-            expected_lineNo=48,
-            expected_startEndColumns=(14, 15),
-            description="local variable declaration"
-        )
-
-        # User defined type
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(58, 8), # symbol `Price` in `Price p ...`
-            expected_uri=FILE_URI,
-            expected_lineNo=55,
-            expected_startEndColumns=(9, 14),
-            description="User defined type on left hand side"
-        )
-
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(58, 18), # symbol `Price` in `Price.wrap()` expected_uri=FILE_URI,
-            expected_uri=FILE_URI,
-            expected_lineNo=55,
-            expected_startEndColumns=(9, 14),
-            description="User defined type on right hand side."
-        )
-
-        # struct constructor also properly jumps to the struct's declaration.
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(64, 33), # symbol `RGBColor` right hand side expression.
-            expected_uri=LIB_URI,
-            expected_lineNo=38,
-            expected_startEndColumns=(7, 15),
-            description="Struct constructor."
-        )
 
     def test_textDocument_definition_imports(self, solc: JsonRpcProcess) -> None:
         self.setup_lsp(solc)

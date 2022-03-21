@@ -50,31 +50,42 @@ contract C
     {
         return Lib.add(n, 1);
         //     ^ @LibSymbol
+        //         ^ @LibAddSymbol
     }
 
     function enums(Color c) public pure returns (Color d)
+    //             ^ @ColorSymbolInParameter
     {
         Color e = Color.Red;
+        //    ^ @eVariableDeclaration
+        //              ^ @RedEnumMemberAccess
         if (c == e)
+        //       ^ @eVariableAccess
             d = Color.Green;
         else
             d = c;
     }
 
     type Price is uint128;
+    //   ^^^^^ @PriceDeclaration
     function udlTest() public pure returns (uint128)
     {
         Price p = Price.wrap(128);
+    //  ^ @PriceSymbol
+    //            ^ @PriceInWrap
         return Price.unwrap(p);
     }
 
     function structCtorTest(uint8 v) public pure returns (uint8 result)
     {
         RGBColor memory c = RGBColor(v, 2 * v, 3 * v);
+        //                       ^ @RGBColorCursor
         result = c.red;
     }
 }
 // ----
+// @PriceInWrap 1234
+// @RGBColor 1235
 // -> textDocument/definition {
 //     "position": @importDirective
 // }
@@ -139,16 +150,91 @@ contract C
 //     "jsonrpc": "2.0",
 //     "result": [
 //         {
-//             "range": {
-//                 "end": {
-//                     "character": 11,
-//                     "line": 22
-//                 },
-//                 "start": {
-//                     "character": 8,
-//                     "line": 22
-//                 }
-//             },
+//             "range": @LibLibrary,
+//             "uri": "lib.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @LibAddSymbol
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @addSymbol,
+//             "uri": "lib.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @ColorSymbolInParameter
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @ColorEnum,
+//             "uri": "lib.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @RedEnumMemberAccess
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @EnumMemberRed,
+//             "uri": "lib.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @eVariableAccess
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @eVariableDeclaration,
+//             "uri": "goto_definition.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @PriceSymbol
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @PriceDeclaration,
+//             "uri": "goto_definition.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @PriceInWrap
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @PriceDeclaration,
+//             "uri": "goto_definition.sol"
+//         }
+//     ]
+// }
+// -> textDocument/definition {
+//     "position": @RGBColorCursor
+// }
+// <- {
+//     "jsonrpc": "2.0",
+//     "result": [
+//         {
+//             "range": @RGBColorStruct,
 //             "uri": "lib.sol"
 //         }
 //     ]

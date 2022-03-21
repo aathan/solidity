@@ -12,8 +12,10 @@ enum Weather {
 
 /// Some custom Color enum type holding 3 colors.
 enum Color {
+//   ^^^^^ @ColorEnum
     /// Red color.
     Red,
+//  ^^^ @EnumMemberRed
     /// Green color.
     Green,
     /// Blue color.
@@ -25,6 +27,7 @@ library Lib
 {
     function add(uint a, uint b) public pure returns (uint result)
 // ^( @addFunction
+//           ^^^ @addSymbol
     {
         result = a + b;
     }
@@ -38,6 +41,7 @@ library Lib
 }
 
 struct RGBColor
+//     ^^^^^^^^ @RGBColorStruct
 {
     uint8 red;
     uint8 green;
