@@ -4,13 +4,15 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 import sys
 
+import requests
+
 # Our scripts/ is not a proper Python package so we need to modify PYTHONPATH to import from it
 # pragma pylint: disable=import-error,wrong-import-position
 SCRIPTS_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common.git_helpers import get_current_git_branch
-from common.rest_api_helpers import CircleCI, Github, download_file
+from common.rest_api_helpers import APIHelperError, CircleCI, Github, download_file
 # pragma pylint: enable=import-error,wrong-import-position
 
 
@@ -93,19 +95,27 @@ def main():
             branch = pr_info['base']['ref']
 
         pipeline = circleci.latest_item(circleci.pipelines(branch))
+        if pipeline is None:
+            print(f"No matching pipeline found.")
+            return 0
+
         pipeline_id = pipeline['id']
         commit_hash = pipeline['vcs']['revision']
         workflow_id = circleci.latest_item(circleci.workflows(pipeline_id))['id']
-        job_number = int(circleci.items_to_dict(
-            'name',
-            circleci.jobs(workflow_id)
-        )['c_ext_benchmarks']['job_number'])
-        artifacts = circleci.items_to_dict('path', circleci.artifacts(job_number))
+        jobs = {job['name']: job for job in circleci.jobs(workflow_id)}
+        job_number = int(jobs['c_ext_benchmarks']['job_number'])
+        artifacts = {artifact['path']: artifact for artifact in circleci.artifacts(job_number)}
 
         download_benchmark(artifacts, 'summarized-benchmarks', branch, commit_hash, options.overwrite)
         download_benchmark(artifacts, 'all-benchmarks', branch, commit_hash, options.overwrite)
 
         return 0
+    except APIHelperError as exception:
+        print(f"ERROR: {exception}", file=sys.stderr)
+        return 1
+    except requests.exceptions.HTTPError as exception:
+        print(f"ERROR: {exception}", file=sys.stderr)
+        return 1
     except CommandLineError as exception:
         print(f"ERROR: {exception}", file=sys.stderr)
         return 1
