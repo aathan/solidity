@@ -27,6 +27,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <stdio.h>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -36,11 +37,6 @@
 using namespace std;
 using namespace solidity::lsp;
 
-#define lspDebug(msg) do { \
-	std::ofstream("/tmp/solc.log", std::ios_base::app) << (msg) << std::endl; \
-} while (0)
-
-// {{{ Transport
 optional<Json::Value> Transport::receive()
 {
 	auto const headers = parseHeaders();
@@ -86,7 +82,6 @@ optional<map<string, string>> Transport::parseHeaders()
 
 		auto const name = boost::to_lower_copy(line.substr(0, delimiterPos));
 		auto const value = line.substr(delimiterPos + 1);
-		lspDebug(fmt::format("parsed header [{}] = \"{}\"", name, value));
 		if (!headers.emplace(
 			boost::trim_copy(name),
 			boost::trim_copy(value)
@@ -133,9 +128,7 @@ void Transport::send(Json::Value _json, MessageID _id)
 	writeBytes(jsonString);
 	flushOutput();
 }
-// }}}
 
-// {{{ IOStreamTransport
 IOStreamTransport::IOStreamTransport(istream& _in, ostream& _out):
 	m_input{_in},
 	m_output{_out}
@@ -168,11 +161,13 @@ void IOStreamTransport::flushOutput()
 {
 	m_output.flush();
 }
-// }}}
 
-// {{{ StdioTransport
 StdioTransport::StdioTransport()
 {
+#if defined(_WIN32)
+	// On Windows, a LF is translated to CRLF, so we put the stdout stream to binary to avoid that.
+	_setmode(fileno(stdout), _O_BINARY);
+#endif
 }
 
 bool StdioTransport::closed() const noexcept
@@ -187,21 +182,14 @@ std::string StdioTransport::readBytes(size_t _byteCount)
 	auto const n = fread(buffer.data(), 1, _byteCount, stdin);
 	if (n < _byteCount)
 		buffer.resize(n);
-	lspDebug(fmt::format("StdioTransport.readBytes({};{};{}): \"{}\"",
-				_byteCount, n, buffer.size(), buffer));
 	return buffer;
 }
 
 std::string StdioTransport::getline()
 {
-	char* lineBuffer = nullptr;
-	size_t numBytesRead = 0;
-	auto const getlineResult = ::getline(&lineBuffer, &numBytesRead, stdin);
-	auto const ensureFreedBuffer = ScopeGuard{ [&]() { free(lineBuffer); }};
-	if (getlineResult > 0)
-		return std::string(lineBuffer, static_cast<size_t>(getlineResult));
-	else
-		return {};
+	string line;
+	std::getline(cin, line);
+	return line;
 }
 
 void StdioTransport::writeBytes(std::string_view _data)
@@ -214,4 +202,3 @@ void StdioTransport::flushOutput()
 {
 	fflush(stdout);
 }
-// }}}
