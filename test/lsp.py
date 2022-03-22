@@ -11,7 +11,9 @@ import re
 import tty
 import functools
 from collections import namedtuple
-
+import queue
+import threading
+from copy import deepcopy
 from typing import Any, List, Optional, Tuple, Union
 from enum import Enum, auto
 from itertools import islice
@@ -23,13 +25,15 @@ TestRegexesTuple = namedtuple("TestRegexesTuple", [
     "sendRequest",
     "findQuotedTag",
     "findTag",
+    "fileDiagnostics",
     "diagnostic"
 ])
 TEST_REGEXES = TestRegexesTuple(
     re.compile(R'^// -> (?P<method>[\w\/]+) {'),
-    re.compile(R'(?P<tag>@\w+)'),
     re.compile(R'(?P<tag>"@\w+")'),
-    re.compile(R'^// (?P<tag>@\w+) (?P<code>\d\d\d\d)'),
+    re.compile(R'(?P<tag>@\w+)'),
+    re.compile(R'// (?P<testname>\w+):[ ]?(?P<diagnostics>[\w @]*)'),
+    re.compile(R'(?P<tag>@\w+) (?P<code>\d\d\d\d)')
 )
 
 TagRegexesTuple = namedtuple("TagRegexestuple", ["simpleRange", "multilineRange"])
@@ -85,12 +89,15 @@ class JsonRpcProcess:
     exe_args: List[str]
     process: subprocess.Popen
     trace_io: bool
-    cached_message: str
+    messages: queue.Queue
+    last_message: None
 
     def __init__(self, exe_path: str, exe_args: List[str], trace_io: bool = True):
         self.exe_path = exe_path
         self.exe_args = exe_args
         self.trace_io = trace_io
+        self.messages = queue.Queue(10)
+        self.last_message = None
 
     def __enter__(self):
         self.process = subprocess.Popen(
@@ -99,7 +106,36 @@ class JsonRpcProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
+        self.async_read_loop()
         return self
+
+    # Reads a message without blocking
+    def read_message(self, peek=False, block=True):
+#        print("read_message(" + str(peek) + ", " + str(block))
+        timeout = 1 if block else 0
+
+        if peek:
+            if self.last_message == None:
+                self.last_message = self.messages.get(block, timeout)
+            return self.last_message
+
+        if self.last_message != None:
+            msg = self.last_message
+            self.last_message = None
+            return msg
+
+        return self.messages.get(block, timeout)
+
+    def async_read_loop(self):
+        def run_loop():
+            while True:
+                msg = self.receive_message()
+                if msg == None:
+                    break
+                self.messages.put(msg)
+
+        thread = threading.Thread(target=run_loop)
+        thread.start()
 
     def __exit__(self, exception_type, exception_value, traceback) -> None:
         self.process.kill()
@@ -109,7 +145,7 @@ class JsonRpcProcess:
         if self.trace_io:
             print(f"{SGR_TRACE}{topic}:{SGR_RESET} {message}")
 
-    def receive_message(self, peek = False) -> Union[None, dict]:
+    def receive_message(self) -> Union[None, dict]:
         # Note, we should make use of timeout to avoid infinite blocking if nothing is received.
         CONTENT_LENGTH_HEADER = "Content-Length: "
         CONTENT_TYPE_HEADER = "Content-Type: "
@@ -119,7 +155,7 @@ class JsonRpcProcess:
         while True:
             # read header
             line = self.process.stdout.readline()
-            if line == '':
+            if len(line) == 0:
                 # server quit
                 return None
             line = line.decode("utf-8")
@@ -162,7 +198,7 @@ class JsonRpcProcess:
 
     def call_method(self, method_name: str, params: Optional[dict]) -> Any:
         self.send_message(method_name, params)
-        return self.receive_message()
+        return self.read_message(block=True)
 
     def send_notification(self, name: str, params: Optional[dict] = None) -> None:
         self.send_message(name, params)
@@ -178,6 +214,10 @@ SGR_STATUS_OKAY = '\033[1;32m'
 SGR_STATUS_FAIL = '\033[1;31m'
 
 class ExpectationFailed(Exception):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+class JSONExpectationFailed(ExpectationFailed):
     def __init__(self, actual, expected):
         self.actual = json.dumps(actual, sort_keys=True)
         self.expected = json.dumps(expected, sort_keys=True)
@@ -232,19 +272,12 @@ class Counter:
     passed: int = 0
     failed: int = 0
 
-class Regexes(Enum):
-    SimpleRange = auto()
-    MultilineRange = auto()
-
-    SendRequest = auto()
-    FindQuotedTag = auto()
-    FindTag = auto()
-    Diagnostic = auto()
 
 # Returns the given marker with the end extended by 'amount'
 def extendEnd(marker, amount=1):
-    marker["end"]["character"] += amount
-    return marker
+    newMarker = deepcopy(marker)
+    newMarker["end"]["character"] += amount
+    return newMarker
 
 class ReplacingTag:
     def __init__(self, tagName, tagRange):
@@ -258,10 +291,17 @@ def encode_tags(z):
     raise TypeError(f'Object of type {o.__class__.__name__} '
                     f'is not JSON serializable')
 
+class TestParserException(Exception):
+    def __init__(self, incompleteResult, msg: str):
+        self.result = incompleteResult
+        super().__init__("Failed to parse test specification: " + msg)
+
 class TestParser:
     RequestAndResponse = namedtuple('RequestAndResponse',
-        "method, request, response, responseBegin, responseEnd"
+        "method, request, response, responseBegin, responseEnd",
+        defaults=(None, None, None, None)
     )
+    Diagnostics = namedtuple('Diagnostics', 'tests start end')
     Diagnostic = namedtuple('Diagnostic', 'marker code')
 
     def __init__(self, content):
@@ -271,11 +311,40 @@ class TestParser:
         self.nextLine()
 
     def parse(self):
-        diagnostics = self.parseDiagnostics()
-        yield diagnostics
+        yield self.parseDiagnostics()
 
         while self.currentLine != None:
-            yield self.parseRequestAndResponse()
+            yield self.RequestAndResponse(**self.parseRequestAndResponse())
+            self.nextLine()
+
+
+    def parseDiagnostics(self):
+        diagnostics = { "tests": {} }
+
+        if self.currentLine != None:
+            diagnostics["start"] = self.position()
+
+        while self.currentLine != None:
+            print(self.currentLine)
+            fileDiagMatch = TEST_REGEXES.fileDiagnostics.match(self.line())
+            if fileDiagMatch == None:
+                diagnostics["end"] = self.position()
+                break
+
+            testDiagnostics = []
+
+            for diagnosticMatch in TEST_REGEXES.diagnostic.finditer(fileDiagMatch.group("diagnostics")):
+                testDiagnostics.append(self.Diagnostic(
+                    diagnosticMatch.group("tag"),
+                    int(diagnosticMatch.group("code"))
+                ))
+
+            diagnostics["tests"][fileDiagMatch.group("testname")] = testDiagnostics
+
+            self.nextLine()
+
+        return self.Diagnostics(**diagnostics)
+
 
     def parseRequestAndResponse(self):
         RESPONSE_START = "// <- {"
@@ -283,14 +352,14 @@ class TestParser:
         COMMENT_PREFIX = "// "
 
         ret = {}
+
         # Parse request header
         requestResult = TEST_REGEXES.sendRequest.match(self.line())
         if requestResult != None:
             ret["method"] = requestResult.group("method")
             ret["request"] = "{\n"
         else:
-            ret["method"] = None
-            return ret
+            raise TestParserException(ret, "Method for request not found")
 
         self.nextLine()
 
@@ -306,8 +375,7 @@ class TestParser:
 
             # Reached end without finding block_end. Abort.
             if self.currentLine == None:
-                ret["request"] = None
-                return ret
+                raise TestParserException(ret, "Request body not found")
 
 
         # Parse response header
@@ -315,23 +383,23 @@ class TestParser:
             ret["response"] = self.line()[len(RESPONSE_START)-1:] + "\n"
             ret["responseBegin"] = self.position()
         else:
-            ret["response"] = None
-            return ret
+            raise TestParserException(ret, "Response header not found")
+
+        self.nextLine()
 
         # Search for request block end
         while self.currentLine != None:
             ret["response"] += self.line()[len(COMMENT_PREFIX):] + "\n"
 
             if self.line().startswith(BLOCK_END):
-                ret["responseEnd"] = self.position()
+                ret["responseEnd"] = self.position() + len(self.line())
                 break
 
             self.nextLine()
 
             # Reached end without finding block_end. Abort.
             if self.currentLine == None:
-                ret["response"] = None
-                return ret
+                raise TestParserException(ret, "Response footer not found")
 
         return ret
 
@@ -345,23 +413,6 @@ class TestParser:
     # Returns current byte position
     def position(self):
         return self.currentLine[0]
-
-    def parseDiagnostics(self):
-        diagnostics = []
-
-        while self.currentLine != None:
-            print(self.currentLine)
-            diagnosticMatch = TEST_REGEXES.diagnostic.match(self.line())
-            if diagnosticMatch == None:
-                break
-
-            diagnostics.append(self.Diagnostic(
-                diagnosticMatch.group("tag"),
-                int(diagnosticMatch.group("code"))
-            ))
-            self.nextLine()
-
-        return diagnostics
 
 
 class SolidityLSPTestSuite: # {{{
@@ -484,16 +535,65 @@ class SolidityLSPTestSuite: # {{{
         Return `count` number of published diagnostic reports sorted by file URI.
         """
         reports = []
-        for _ in range(0, count):
-            message = solc.receive_message()
+
+#        import pdb; pdb.set_trace()
+        for num in range(0, count):
+            try:
+                message = solc.read_message(peek=True, block=True)
+            except:
+                break
+
             assert message is not None # This can happen if the server aborts early.
-            reports.append(
-                self.require_params_for_method(
-                    'textDocument/publishDiagnostics',
-                    message,
+
+            if "method" in message and message["method"] == "textDocument/publishDiagnostics":
+                reports.append(
+                    self.require_params_for_method(
+                        'textDocument/publishDiagnostics',
+                        message,
+                    )
                 )
-            )
+                solc.read_message(peek=False) # remove peeked message
+            else:
+                break
+
         return sorted(reports, key=lambda x: x['uri'])
+
+    def fetch_and_format_diagnostics(self, solc: JsonRpcProcess, test):
+        expectations = ""
+
+        published_diagnostics = self.open_file_and_wait_for_diagnostics(solc, test, 100)
+
+        for diagnostics in published_diagnostics:
+            testname = diagnostics["uri"].replace(self.project_root_uri + "/", "")[:-len(".sol")]
+
+            # Skip empty diagnostics within the same file
+            if len(diagnostics["diagnostics"]) == 0 and testname == test:
+                continue
+
+            expectations += f"// {testname}:"
+
+            for diagnostic in diagnostics["diagnostics"]:
+                tag = self.find_tag_with_range(testname, diagnostic['range'])
+
+                if tag == None:
+                    raise Exception(f"No tag found for diagnostic range {diagnostic['range']}")
+
+                expectations += f" {tag} {diagnostic['code']}"
+            expectations += "\n"
+
+        return expectations
+
+    def update_diagnostics_in_file(self, solc: JsonRpcProcess, test, content, diagStart, diagEnd):
+        new_diagnostics = self.fetch_and_format_diagnostics(solc, test)
+
+        content = content[:diagStart] + \
+            self.fetch_and_format_diagnostics(solc, test) + \
+            content[diagEnd:]
+
+        with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
+            f.write(content)
+
+        return content
 
     def open_file_and_wait_for_diagnostics(
         self,
@@ -532,7 +632,7 @@ class SolidityLSPTestSuite: # {{{
         # Failed assertions are always printed.
         self.assertion_counter.failed += 1
         print(prefix + SGR_STATUS_FAIL + 'FAILED' + SGR_RESET)
-        raise ExpectationFailed(actual, expected)
+        raise JSONExpectationFailed(actual, expected)
 
     def expect_empty_diagnostics(self, published_diagnostics: List[dict]) -> None:
         self.expect_equal(len(published_diagnostics), 1, "one publish diagnostics notification")
@@ -546,7 +646,6 @@ class SolidityLSPTestSuite: # {{{
         startEndColumns: Tuple[int, int] = None,
         marker: {} = None
     ):
-        print(diagnostic)
         self.expect_equal(diagnostic['code'], code, f'diagnostic: {code}')
 
         if marker:
@@ -620,7 +719,7 @@ class SolidityLSPTestSuite: # {{{
         def replace_tag(data, markers):
             # Check if we need markers from a specific file
             if "uri" in data:
-                markers = self.getFileMarkers(data["uri"][:-len(".sol")])
+                markers = self.get_file_tags(data["uri"][:-len(".sol")])
 
             for key, val in data.items():
                 if key == "range":
@@ -641,10 +740,19 @@ class SolidityLSPTestSuite: # {{{
         return replace_tag(contentJson, markersFallback)
 
 
+    def find_tag_with_range(self, test, range):
+        markers = self.get_file_tags(test)
+
+        for tag, tagRange in markers.items():
+            if tagRange == range:
+                return str(tag)
+
+        return None
+
     def replace_ranges_with_tags(self, content):
         # Replace matching ranges with "@<tagname>"
         for result in content["result"]:
-            markers = self.getFileMarkers(result["uri"][:-len(".sol")])
+            markers = self.get_file_tags(result["uri"][:-len(".sol")])
             if "range" in result:
                 for tag, tagRange in markers.items():
                     if tagRange == result["range"]:
@@ -655,6 +763,31 @@ class SolidityLSPTestSuite: # {{{
 
         # remove the quotes and return result
         return "".join(map(lambda p: p[1:-1] if p.startswith('"@') else p, splitted))
+
+    def userInteractionFailedDiagnostics(self, solc: JsonRpcProcess, test, content, start, end):
+        print("(u)pdate/(r)etry/(i)gnore?")
+        userResponse = sys.stdin.read(1)
+        if userResponse == "u":
+            while True:
+                try:
+                    content = self.update_diagnostics_in_file(solc, test, content, start, end)
+                    break
+                except Exception as e:
+                    print(e)
+                    print(self.get_file_tags(test))
+                    print("(e)dit/(r)etry/(i)gnore?")
+                    userResponse = sys.stdin.read(1)
+                    if userResponse == "e":
+                        subprocess.getstatusoutput(f'$EDITOR {self.get_test_file_path(test)}')
+                        pass
+                    elif userResponse == "r":
+                        print("retrying...")
+                        self.get_file_tags.cache_clear()
+                        break
+                    elif userResponse == "i":
+                        print("ignoring...")
+                        break
+
 
     # }}}
 
@@ -841,7 +974,8 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(report['uri'], self.get_test_file_uri('lib'), "Correct file URI")
         self.expect_equal(len(report['diagnostics']), 1, "one diagnostic")
 
-        marker = self.get_file_tags('lib')["@diagnostics"]
+        markers = self.get_file_tags('lib')
+        marker = markers["@diagnostics"]
         self.expect_diagnostic(report['diagnostics'][0], code=2072, marker=marker)
 
     def test_generic(self, solc: JsonRpcProcess) -> None:
@@ -849,62 +983,122 @@ class SolidityLSPTestSuite: # {{{
         TESTS = ['goto_definition']
 
         for test in TESTS:
-            content = self.get_test_file_contents(test)
-            markers = self.getFileMarkers(test)
+            content = None
+            markers = None
 
-            for part in TestParser(content).parse():
-                if isinstance(part, list):
-                    print(part)
+            testFails = True
+            parsedTestcases = None
+            expectedDiagnostics = None
+
+            while testFails:
+                try:
+                    content = self.get_test_file_contents(test)
+                    markers = self.get_file_tags(test)
+                    parsedTestcases = TestParser(content).parse()
+
+                    # Process diagnostics first
+                    expectedDiagnostics = next(parsedTestcases)
+                    assert isinstance(expectedDiagnostics, TestParser.Diagnostics) is True
+
+                    tests = expectedDiagnostics.tests
+
+                    if test not in tests:
+                        tests[test] = []
+
                     published_diagnostics = \
-                        self.open_file_and_wait_for_diagnostics(solc, test, len(part))
+                        self.open_file_and_wait_for_diagnostics(solc, test, len(tests))
+                    self.expect_equal(
+                        len(published_diagnostics),
+                        len(tests),
+                        "Amount of reports does not match!")
 
-                    print(published_diagnostics)
-                    self.expect_equal(len(published_diagnostics), len(part), "Amount of diagnostic does not match!")
-                    for actual, expected in zip(published_diagnostics, part):
-                        self.expect_equal(True, expected.marker in markers, "Marker " + expected.marker + " not found.")
-                        self.expect_diagnostic(
-                            actual,
-                            code=expected.code,
-                            marker=markers[expected.marker]
+                    for diagnostics in published_diagnostics:
+                        testname = diagnostics["uri"].replace(self.project_root_uri + "/", "")[:-len(".sol")]
+
+                        expected_diagnostics = tests[testname]
+                        self.expect_equal(
+                            len(diagnostics["diagnostics"]),
+                            len(expected_diagnostics),
+                            "Unexpected amount of diagnostics"
                         )
+                        lMarkers = self.get_file_tags(testname)
+                        for diagnostic in diagnostics["diagnostics"]:
+                            expected_diagnostic = next((x for x in
+                                expected_diagnostics if diagnostic['range'] ==
+                                lMarkers[x.marker]), None)
 
+                            if expected_diagnostic == None:
+                                raise ExpectationFailed(f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
+
+                            #import pdb; pdb.set_trace()
+                            self.expect_diagnostic(
+                                diagnostic,
+                                code=expected_diagnostic.code,
+                                marker=lMarkers[expected_diagnostic.marker]
+                            )
+
+                        testFails = False
+                except ExpectationFailed as e:
+                    print(e)
+                    self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostic.start, expectedDiagnostic.end)
                     continue
 
-                requestBodyJson = self.parse_json_with_tags(part['request'], markers)
-                # add textDocument/uri if missing
-                if 'textDocument' not in requestBodyJson:
-                    requestBodyJson['textDocument'] = { 'uri': self.get_test_file_uri(test) }
-                actualResponseJson = solc.call_method(part['method'], requestBodyJson)
-
-                for result in actualResponseJson["result"]:
-                    result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
-
                 try:
-                    expectedResponseJson = self.parse_json_with_tags(part['response'], markers)
-                except json.decoder.JSONDecodeError:
-                    expectedResponseJson = None
+                    # Now handle each request/response pair in the test definition
+                    for testcase in parsedTestcases:
+
+                        requestBodyJson = self.parse_json_with_tags(testcase.request, markers)
+                        # add textDocument/uri if missing
+                        if 'textDocument' not in requestBodyJson:
+                            requestBodyJson['textDocument'] = { 'uri': self.get_test_file_uri(test) }
+                        actualResponseJson = solc.call_method(testcase.method, requestBodyJson)
+
+                        #print(actualResponseJson)
+                        if "method" in actualResponseJson and \
+                            actualResponseJson["method"] == "textDocument/publishDiagnostics":
+
+                            print("Received more diagnostics than expected: \n" +
+                                json.dumps(actualResponseJson["params"], indent=4, sort_keys=True))
+                            self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostic.start, expectedDiagnostic.end)
+                            break
 
 
-                if expectedResponseJson != actualResponseJson:
-                    print("Request failed: \n" + request)
-                    actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
+                        for result in actualResponseJson["result"]:
+                            result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
 
-                    if expectedResponseJson == None:
-                        print("Failed to parse expected response, received: \n" + actualResponsePretty)
+                        try:
+                            expectedResponseJson = self.parse_json_with_tags(testcase.response, markers)
+                        except json.decoder.JSONDecodeError:
+                            expectedResponseJson = None
+
+
+                        if expectedResponseJson != actualResponseJson:
+                            print("Request failed: \n" + testcase.request)
+                            actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
+
+                            if expectedResponseJson == None:
+                                print("Failed to parse expected response, received: \n" + actualResponsePretty)
+                            else:
+                                print("Expected:\n" + \
+                                    self.replace_ranges_with_tags(expectedResponseJson) + \
+                                    "\nbut got:\n" + actualResponsePretty
+                                )
+                            print("(u)pdate/(r)etry/(i)gnore?")
+                            userResponse = sys.stdin.read(1)
+                            if userResponse == "u":
+                                content = content[:testcase.responseBegin] + \
+                                    preceedComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
+                                    content[testcase.responseEnd:]
+
+                                with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
+                                    f.write(content)
                     else:
-                        print("Expected:\n" + \
-                            self.replace_ranges_with_tags(expectedResponseJson) + \
-                            "\nbut got:\n" + actualResponsePretty
-                        )
-                    print("(u)pdate/(r)etry/(i)gnore?")
-                    userResponse = sys.stdin.read(1)
-                    if userResponse == "u":
-                        content = content[:part['responseBegin']] + \
-                            preceedComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
-                            content[part['responseEnd']:]
+                        continue
+                except TestParserException as e:
+                    print(e)
+                    print(e.result)
 
-                        with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
-                            f.write(content)
+
 
 
     def test_textDocument_didChange_updates_diagnostics(self, solc: JsonRpcProcess) -> None:
@@ -1173,9 +1367,9 @@ class SolidityLSPTestSuite: # {{{
         })
         published_diagnostics = self.wait_for_diagnostics(solc, 2)
         self.expect_equal(len(published_diagnostics), 2, "publish diagnostics for 2 files")
-        self.expect_equal(len(published_diagnostics[0]['diagnostics']), 0)
+        self.expect_equal(len(published_diagnostics[0]['diagnostics']), 1)
         self.expect_equal(len(published_diagnostics[1]['diagnostics']), 1)
-        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 33, (8, 19)) # unused variable in lib.sol
+        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 37, (8, 19)) # unused variable in lib.sol
 
     def test_textDocument_definition_imports(self, solc: JsonRpcProcess) -> None:
         self.setup_lsp(solc)
@@ -1194,7 +1388,7 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(published_diagnostics), 2, "publish diagnostics for 2 files")
         self.expect_equal(len(published_diagnostics[0]['diagnostics']), 0)
         self.expect_equal(len(published_diagnostics[1]['diagnostics']), 1)
-        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 33, (8, 19)) # unused variable in lib.sol
+        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 37, (8, 19)) # unused variable in lib.sol
 
         # import directive: test symbol alias
         self.expect_goto_definition_location(

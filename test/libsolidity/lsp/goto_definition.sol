@@ -81,11 +81,13 @@ contract C
         RGBColor memory c = RGBColor(v, 2 * v, 3 * v);
         //                       ^ @RGBColorCursor
         result = c.red;
+        int a;
+//      ^^^^^ @unusedLocalVar
     }
 }
 // ----
-// @PriceInWrap 1234
-// @RGBColor 1235
+// goto_definition: @unusedLocalVar 2072
+// lib: @diagnostics 2072
 // -> textDocument/definition {
 //     "position": @importDirective
 // }

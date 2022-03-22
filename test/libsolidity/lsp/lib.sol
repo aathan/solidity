@@ -47,3 +47,4 @@ struct RGBColor
     uint8 green;
     uint8 blue;
 }
+// ----
